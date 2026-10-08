@@ -5,6 +5,7 @@ import {
   LockContentionError,
   createLockRecord,
   memoryMaintenanceLockPath,
+  sweepEmptyTranscriptJournals,
   withLock,
 } from "@oh-my-opencode/memory-core"
 
@@ -26,6 +27,7 @@ export interface MemoryMaintenanceOptions {
   readonly minLooseObjects?: number
   readonly timeoutMs?: number
   readonly now?: () => number
+  readonly isLiveSession?: (sessionId: string) => boolean
 }
 
 export interface MemoryMaintenance {
@@ -75,6 +77,22 @@ export function createMemoryMaintenance(options: MemoryMaintenanceOptions = {}):
   const timers = new Map<ReturnType<typeof setTimeout>, () => void>()
   const running = new Set<Promise<void>>()
 
+  async function sweepJournals(context: MemoryIdentityContext): Promise<void> {
+    const result = await sweepEmptyTranscriptJournals({
+      transcriptsDir: context.identityPaths.transcripts,
+      now,
+      ...(options.isLiveSession === undefined ? {} : { isLive: options.isLiveSession }),
+    })
+    if (result.removed.length > 0) {
+      options.logger?.info("omo-senpi memory removed empty transcript journals", {
+        identity: context.identity,
+        removed: result.removed.length,
+        reason: "no messages, no reflection state, idle 10+ minutes",
+        kept: result.kept,
+      })
+    }
+  }
+
   async function run(context: MemoryIdentityContext, signal: AbortSignal): Promise<void> {
     // A transient identity has no repo until it is promoted.
     if (!existsSync(context.identityPaths.repo)) return
@@ -106,6 +124,17 @@ export function createMemoryMaintenance(options: MemoryMaintenanceOptions = {}):
     schedule(context): void {
       if (scheduled.has(context.identity)) return
       scheduled.add(context.identity)
+      // The sweep is a few stats, so it runs at once rather than behind the repack delay: control
+      // sessions (health checks) exit within seconds and their dispose() would cancel the timer.
+      const sweep: Promise<void> = sweepJournals(context)
+        .catch((error: unknown) => {
+          options.logger?.warn("omo-senpi memory empty transcript sweep failed", {
+            identity: context.identity,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+        .finally(() => running.delete(sweep))
+      running.add(sweep)
       let finish = (): void => {}
       const pass = new Promise<void>((resolve) => {
         finish = resolve
