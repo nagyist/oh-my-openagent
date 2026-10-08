@@ -160,7 +160,8 @@ export async function sweepEmptyTranscriptJournals(
   try {
     entries = await readdir(options.transcriptsDir, { withFileTypes: true })
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return { removed, kept }
+    // No transcripts directory, or a path segment above it is a file: there are no journals.
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return { removed, kept }
     throw error
   }
   for (const entry of entries) {

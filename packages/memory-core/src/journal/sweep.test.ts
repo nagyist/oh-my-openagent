@@ -119,15 +119,18 @@ describe("empty transcript journal sweep (#9737)", () => {
     expect(result.removed).toEqual(["blank"])
   })
 
-  it("#given no transcripts directory #when swept #then nothing happens", async () => {
+  it("#given no transcripts directory, or one under a file #when swept #then nothing happens and nothing throws", async () => {
     // given
-    const root = join(await transcriptsDir(), "missing")
+    const parent = await transcriptsDir()
+    await writeFile(join(parent, "memory"), "not a directory", "utf8")
 
     // when
-    const result = await sweepEmptyTranscriptJournals({ transcriptsDir: root, now: () => NOW })
+    const missing = await sweepEmptyTranscriptJournals({ transcriptsDir: join(parent, "missing"), now: () => NOW })
+    const underFile = await sweepEmptyTranscriptJournals({ transcriptsDir: join(parent, "memory", "agents", "a", "runtime", "transcripts"), now: () => NOW })
 
     // then
-    expect(result).toEqual({ removed: [], kept: {} })
+    expect(missing).toEqual({ removed: [], kept: {} })
+    expect(underFile).toEqual({ removed: [], kept: {} })
   })
 
   it("#given a journal whose only file is an empty state #when swept #then it is removed, so an interrupted sweep never strands it", async () => {
