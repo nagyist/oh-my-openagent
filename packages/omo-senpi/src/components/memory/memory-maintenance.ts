@@ -63,6 +63,8 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
  *   writer has just created is never removed.
  * - Off the hot path: it starts after a delay, the timer never keeps a process alive, `dispose()` (session
  *   exit) cancels it and stops a running git, and every failure is logged, never raised.
+ * - Empty transcript journals left by older builds (#9737) are swept once per identity per process, at
+ *   once rather than behind the delay: control sessions exit within seconds and dispose() would cancel it.
  */
 export function createMemoryMaintenance(options: MemoryMaintenanceOptions = {}): MemoryMaintenance {
   const createRepo = options.createRepo
@@ -74,6 +76,7 @@ export function createMemoryMaintenance(options: MemoryMaintenanceOptions = {}):
   const now = options.now ?? Date.now
   let abort = new AbortController()
   const scheduled = new Set<string>()
+  const swept = new Set<string>()
   const timers = new Map<ReturnType<typeof setTimeout>, () => void>()
   const running = new Set<Promise<void>>()
 
@@ -124,17 +127,18 @@ export function createMemoryMaintenance(options: MemoryMaintenanceOptions = {}):
     schedule(context): void {
       if (scheduled.has(context.identity)) return
       scheduled.add(context.identity)
-      // The sweep is a few stats, so it runs at once rather than behind the repack delay: control
-      // sessions (health checks) exit within seconds and their dispose() would cancel the timer.
-      const sweep: Promise<void> = sweepJournals(context)
-        .catch((error: unknown) => {
-          options.logger?.warn("omo-senpi memory empty transcript sweep failed", {
-            identity: context.identity,
-            error: error instanceof Error ? error.message : String(error),
+      if (!swept.has(context.identity)) {
+        swept.add(context.identity)
+        const sweep: Promise<void> = sweepJournals(context)
+          .catch((error: unknown) => {
+            options.logger?.warn("omo-senpi memory empty transcript sweep failed", {
+              identity: context.identity,
+              error: error instanceof Error ? error.message : String(error),
+            })
           })
-        })
-        .finally(() => running.delete(sweep))
-      running.add(sweep)
+          .finally(() => running.delete(sweep))
+        running.add(sweep)
+      }
       let finish = (): void => {}
       const pass = new Promise<void>((resolve) => {
         finish = resolve

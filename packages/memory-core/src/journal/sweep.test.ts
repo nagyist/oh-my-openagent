@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { existsSync, realpathSync } from "node:fs"
-import { mkdir, mkdtemp, utimes, writeFile } from "node:fs/promises"
+import { lutimes, mkdir, mkdtemp, readFile, symlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
+import type { JournalLock } from "./lock"
 import { sweepEmptyTranscriptJournals } from "./sweep"
 import { removeTree } from "../../../../test-support/remove-tree"
 
@@ -39,8 +40,10 @@ async function journal(
   const dir = join(root, sessionId)
   await mkdir(dir, { recursive: true })
   for (const [name, content] of Object.entries(files)) {
+    await mkdir(dirname(join(dir, name)), { recursive: true })
     await writeFile(join(dir, name), content, "utf8")
     await utimes(join(dir, name), modifiedAt, modifiedAt)
+    await utimes(dirname(join(dir, name)), modifiedAt, modifiedAt)
   }
   await utimes(dir, modifiedAt, modifiedAt)
   return dir
@@ -79,7 +82,8 @@ describe("empty transcript journal sweep (#9737)", () => {
       await journal(root, "locked", { "transcript.jsonl": "", "state.json": EMPTY_STATE, "state.lock": "123\n" }),
       await journal(root, "recent", { "transcript.jsonl": "", "state.json": EMPTY_STATE }, new Date(NOW - 60 * 1000)),
       await journal(root, "live-session", { "transcript.jsonl": "", "state.json": EMPTY_STATE }),
-      await journal(root, "no-transcript", { "state.json": EMPTY_STATE }),
+      await journal(root, "with-subdirectory", { "transcript.jsonl": "", "state.json": EMPTY_STATE, "nested/file": "" }),
+      await journal(root, "with-large-transcript", { "transcript.jsonl": " ".repeat(5000), "state.json": EMPTY_STATE }),
     ]
 
     // when
@@ -93,14 +97,13 @@ describe("empty transcript journal sweep (#9737)", () => {
     expect(result.removed).toEqual([])
     for (const dir of keepers) expect(existsSync(dir)).toBe(true)
     expect(result.kept).toEqual({
-      "transcript-content": 1,
+      "transcript-content": 2,
       "state-content": 2,
       "state-unreadable": 1,
-      "other-content": 1,
+      "other-content": 2,
       locked: 1,
       recent: 1,
       live: 1,
-      "no-transcript": 1,
     })
   })
 
@@ -125,5 +128,89 @@ describe("empty transcript journal sweep (#9737)", () => {
 
     // then
     expect(result).toEqual({ removed: [], kept: {} })
+  })
+
+  it("#given a journal whose only file is an empty state #when swept #then it is removed, so an interrupted sweep never strands it", async () => {
+    // given
+    const root = await transcriptsDir()
+    await journal(root, "state-only", { "state.json": EMPTY_STATE })
+
+    // when
+    const result = await sweepEmptyTranscriptJournals({ transcriptsDir: root, now: () => NOW })
+
+    // then
+    expect(result.removed).toEqual(["state-only"])
+  })
+
+  it("#given only one file or only the directory changed recently #when swept #then the journal is kept", async () => {
+    // given
+    const root = await transcriptsDir()
+    const recentFile = await journal(root, "recent-file", { "transcript.jsonl": "", "state.json": EMPTY_STATE })
+    await utimes(join(recentFile, "state.json"), new Date(NOW - 1000), new Date(NOW - 1000))
+    const recentDir = await journal(root, "recent-dir", { "transcript.jsonl": "", "state.json": EMPTY_STATE })
+    await utimes(recentDir, new Date(NOW - 1000), new Date(NOW - 1000))
+
+    // when
+    const result = await sweepEmptyTranscriptJournals({ transcriptsDir: root, now: () => NOW })
+
+    // then
+    expect(result.removed).toEqual([])
+    expect(result.kept).toEqual({ recent: 2 })
+  })
+
+  it("#given a writer appends the first row while the sweep waits for the journal lock #when the sweep gets the lock #then it re-checks, keeps the journal and the row", async () => {
+    // given
+    const root = await transcriptsDir()
+    const dir = await journal(root, "racing", { "transcript.jsonl": "", "state.json": EMPTY_STATE })
+    const row = `${JSON.stringify({ kind: "user", text: "hi", captured_at: "x", source_line_id: "u1:user", source_message_id: "u1" })}\n`
+    const writerFirst: JournalLock = async (_lockPath, task) => {
+      await writeFile(join(dir, "transcript.jsonl"), row, "utf8")
+      await utimes(join(dir, "transcript.jsonl"), OLD, OLD)
+      return task()
+    }
+
+    // when
+    const result = await sweepEmptyTranscriptJournals({ transcriptsDir: root, now: () => NOW, lock: writerFirst })
+
+    // then
+    expect(result.removed).toEqual([])
+    expect(result.kept).toEqual({ "transcript-content": 1 })
+    expect(await readFile(join(dir, "transcript.jsonl"), "utf8")).toBe(row)
+  })
+
+  it("#given another process holds the journal lock past the wait #when swept #then the journal is kept as locked", async () => {
+    // given
+    const root = await transcriptsDir()
+    const dir = await journal(root, "contended", { "transcript.jsonl": "", "state.json": EMPTY_STATE })
+    const contended: JournalLock = async (lockPath) => {
+      const { JournalLockTimeoutError } = await import("./lock")
+      throw new JournalLockTimeoutError(lockPath)
+    }
+
+    // when
+    const result = await sweepEmptyTranscriptJournals({ transcriptsDir: root, now: () => NOW, lock: contended })
+
+    // then
+    expect(result.kept).toEqual({ locked: 1 })
+    expect(existsSync(dir)).toBe(true)
+  })
+
+  it("#given a journal whose transcript is a symlink to an empty file elsewhere #when swept #then it is kept and the target is untouched", async () => {
+    // given
+    const root = await transcriptsDir()
+    const outside = join(await transcriptsDir(), "elsewhere.jsonl")
+    await writeFile(outside, "", "utf8")
+    const dir = await journal(root, "linked", { "state.json": EMPTY_STATE })
+    await symlink(outside, join(dir, "transcript.jsonl"))
+    await lutimes(join(dir, "transcript.jsonl"), OLD, OLD)
+    await utimes(dir, OLD, OLD)
+
+    // when
+    const result = await sweepEmptyTranscriptJournals({ transcriptsDir: root, now: () => NOW })
+
+    // then
+    expect(result.kept).toEqual({ "other-content": 1 })
+    expect(existsSync(dir)).toBe(true)
+    expect(existsSync(outside)).toBe(true)
   })
 })

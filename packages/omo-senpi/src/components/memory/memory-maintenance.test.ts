@@ -286,4 +286,35 @@ describe("createMemoryMaintenance", () => {
     // then
     expect(existsSync(dir)).toBe(false)
   }, 30_000)
+
+  test("#given the sweep ran for an identity #when a later session in the same process schedules maintenance #then it does not sweep again (#9737)", async () => {
+    // given
+    const root = realpathSync.native(await mkdtemp(join(tmpdir(), "omo-memory-maintenance-")))
+    roots.push(root)
+    const identityPaths = buildIdentityPaths(root, "transient-agent")
+    const context = createMemoryIdentityContext({
+      identity: "transient-agent",
+      identityPaths,
+      binding: createMemoryBinding({ identity: "transient-agent", repoPath: identityPaths.repo, boundAt: 1 }),
+    })
+    const log = recorder()
+    const maintenance = createMemoryMaintenance({ logger: log.logger, delayMs: 60_000 })
+    maintenance.schedule(context)
+    maintenance.dispose()
+    await maintenance.settled()
+    const old = new Date(Date.now() - 60 * 60 * 1000)
+    const dir = join(identityPaths.transcripts, "later-empty")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "transcript.jsonl"), "")
+    await utimes(join(dir, "transcript.jsonl"), old, old)
+    await utimes(dir, old, old)
+
+    // when
+    maintenance.schedule(context)
+    maintenance.dispose()
+    await maintenance.settled()
+
+    // then
+    expect(existsSync(dir)).toBe(true)
+  }, 30_000)
 })
